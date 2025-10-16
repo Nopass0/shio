@@ -52,7 +52,7 @@ class QuickChatMod(loader.Module):
         "welcome": "👋 Чат создан через Hikka. Настрой всё под себя!",
     }
 
-    async def quickchat(self, message: Message):
+    async def quickchatcmd(self, message: Message):
         """Create a supergroup chat. Optional participants can be specified after a separator."""
 
         title, raw_participants = self._extract_command_parts(message)
