@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from dataclasses import dataclass
 import secrets
 import string
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import aiohttp
+from hikkatl.tl import functions
 from hikkatl.tl.types import Message
 
 from .. import loader, utils
@@ -38,6 +41,9 @@ class TempMailMod(loader.Module):
     strings = {
         "name": "TempMail",
         "new_mailbox": "📬 <b>Temporary mailbox created:</b> <code>{email}</code>",
+        "chat_created": "💬 <b>Chat <a href=\"{link}\">{title}</a> created for mailbox.</b>",
+        "chat_created_no_link": "💬 <b>Chat <code>{title}</code> created for mailbox.</b>",
+        "chat_failed": "💢 <b>Failed to create mailbox chat:</b> {error}",
         "current_mailbox": "📮 <b>Current mailbox:</b> <code>{email}</code>",
         "no_mailbox": "🚫 <b>No mailbox yet.</b> Use <code>{prefix}tempmail new</code>.",
         "invalid_id": "❓ <b>Specify a valid message ID.</b>",
@@ -48,6 +54,18 @@ class TempMailMod(loader.Module):
         "message_header": "✉️ <b>Message #{id} for <code>{email}</code>:</b>",
         "message_fields": "<b>From:</b> {sender}\n<b>Subject:</b> {subject}\n<b>Date:</b> {date}",
         "message_body": "\n\n<code>{body}</code>",
+        "chat_about": "Temporary mailbox chat created via TempMail module.",
+        "chat_welcome": (
+            "👋 This chat was created for <code>{email}</code>. "
+            "New incoming messages will appear here automatically."
+        ),
+        "chat_email": (
+            "✉️ <b>New email for <code>{email}</code></b>\n"
+            "<b>From:</b> {sender}\n"
+            "<b>Subject:</b> {subject}\n"
+            "<b>Date:</b> {date}{body}"
+        ),
+        "chat_email_body": "\n\n<code>{body}</code>",
         "usage": (
             "ℹ️ <b>Usage:</b> <code>{prefix}tempmail [new|inbox|read &lt;id&gt;]</code>\n"
             "Without arguments shows current mailbox or creates a new one."
@@ -58,6 +76,9 @@ class TempMailMod(loader.Module):
         "_cls_doc": "Создаёт временный почтовый ящик и позволяет читать письма",
         "name": "TempMail",
         "new_mailbox": "📬 <b>Создан временный ящик:</b> <code>{email}</code>",
+        "chat_created": "💬 <b>Создан чат <a href=\"{link}\">{title}</a> для ящика.</b>",
+        "chat_created_no_link": "💬 <b>Создан чат <code>{title}</code> для ящика.</b>",
+        "chat_failed": "💢 <b>Не удалось создать чат для ящика:</b> {error}",
         "current_mailbox": "📮 <b>Текущий ящик:</b> <code>{email}</code>",
         "no_mailbox": "🚫 <b>Ящик ещё не создан.</b> Используй <code>{prefix}tempmail new</code>.",
         "invalid_id": "❓ <b>Укажи корректный ID письма.</b>",
@@ -68,6 +89,18 @@ class TempMailMod(loader.Module):
         "message_header": "✉️ <b>Письмо №{id} для <code>{email}</code>:</b>",
         "message_fields": "<b>От:</b> {sender}\n<b>Тема:</b> {subject}\n<b>Дата:</b> {date}",
         "message_body": "\n\n<code>{body}</code>",
+        "chat_about": "Чат для временной почты, созданный модулем TempMail.",
+        "chat_welcome": (
+            "👋 Чат создан для <code>{email}</code>. "
+            "Новые входящие письма будут появляться здесь автоматически."
+        ),
+        "chat_email": (
+            "✉️ <b>Новое письмо для <code>{email}</code></b>\n"
+            "<b>От:</b> {sender}\n"
+            "<b>Тема:</b> {subject}\n"
+            "<b>Дата:</b> {date}{body}"
+        ),
+        "chat_email_body": "\n\n<code>{body}</code>",
         "usage": (
             "ℹ️ <b>Использование:</b> <code>{prefix}tempmail [new|inbox|read &lt;id&gt;]</code>\n"
             "Без аргументов показывает текущий ящик или создаёт новый."
@@ -77,6 +110,12 @@ class TempMailMod(loader.Module):
     def __init__(self) -> None:
         self._mailbox: Optional[MailAccount] = None
         self._timeout = aiohttp.ClientTimeout(total=10)
+        self._mail_chat = None
+        self._mail_chat_peer = None
+        self._poll_task: Optional[asyncio.Task] = None
+        self._known_message_ids: Set[str] = set()
+        self._poll_interval = 30
+        self._poll_error_delay = 10
 
     async def tempmailcmd(self, message: Message):
         """Manage temporary mailbox. Use no args to show or new to regenerate"""
@@ -122,13 +161,23 @@ class TempMailMod(loader.Module):
             )
             return
 
+        await self._stop_polling()
         self._mailbox = mailbox
-        await utils.answer(
-            message,
+        self._mail_chat = None
+        self._mail_chat_peer = None
+        self._known_message_ids.clear()
+
+        response_lines = [
             self.strings("new_mailbox").format(
                 email=utils.escape_html(self._format_mailbox())
-            ),
-        )
+            )
+        ]
+
+        chat_line = await self._create_mail_chat(mailbox)
+        if chat_line:
+            response_lines.append(chat_line)
+
+        await utils.answer(message, "\n".join(response_lines))
 
     async def _show_inbox(self, message: Message) -> None:
         mailbox = self._mailbox
@@ -294,6 +343,132 @@ class TempMailMod(loader.Module):
             raise RuntimeError("unexpected message response")
         return data
 
+    async def _create_mail_chat(self, mailbox: MailAccount) -> str:
+        title = mailbox.as_email()
+
+        try:
+            result = await self._client(
+                functions.channels.CreateChannelRequest(
+                    title=title,
+                    about=self.strings("chat_about"),
+                    megagroup=True,
+                )
+            )
+        except Exception as error:  # noqa: BLE001
+            return self.strings("chat_failed").format(
+                error=utils.escape_html(str(error))
+            )
+
+        if not result.chats:
+            return self.strings("chat_failed").format(
+                error=utils.escape_html("no chat returned")
+            )
+
+        chat = result.chats[0]
+        self._mail_chat = chat
+
+        try:
+            self._mail_chat_peer = await self._client.get_input_entity(chat)
+        except Exception:  # noqa: BLE001
+            self._mail_chat_peer = chat
+
+        link = utils.get_entity_url(chat)
+
+        try:
+            await self._client.send_message(
+                self._mail_chat_peer,
+                self.strings("chat_welcome").format(
+                    email=utils.escape_html(mailbox.as_email())
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        await self._initialize_known_messages()
+        self._start_polling()
+
+        if link:
+            return self.strings("chat_created").format(
+                title=utils.escape_html(title),
+                link=link,
+            )
+        return self.strings("chat_created_no_link").format(
+            title=utils.escape_html(title)
+        )
+
+    async def _initialize_known_messages(self) -> None:
+        try:
+            messages = await self._fetch_messages()
+        except Exception:  # noqa: BLE001
+            self._known_message_ids.clear()
+            return
+
+        self._known_message_ids = {
+            item.get("id")
+            for item in messages
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and item.get("id")
+        }
+
+    def _start_polling(self) -> None:
+        if self._poll_task or not self._mailbox or not self._mail_chat_peer:
+            return
+
+        loop = asyncio.get_running_loop()
+        self._poll_task = loop.create_task(self._poll_loop())
+
+    async def _stop_polling(self) -> None:
+        task = self._poll_task
+        if not task:
+            return
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        self._poll_task = None
+
+    async def _poll_loop(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while self._mailbox and self._mail_chat_peer:
+                await self._poll_once()
+                await asyncio.sleep(self._poll_interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(self._poll_error_delay)
+            if self._mailbox and self._mail_chat_peer:
+                loop = asyncio.get_running_loop()
+                self._poll_task = loop.create_task(self._poll_loop())
+        finally:
+            if self._poll_task is current_task:
+                self._poll_task = None
+
+    async def _poll_once(self) -> None:
+        messages = await self._fetch_messages()
+        for item in messages:
+            message_id = item.get("id")
+            if not isinstance(message_id, str) or not message_id:
+                continue
+            if message_id in self._known_message_ids:
+                continue
+
+            try:
+                data = await self._fetch_message(message_id)
+            except Exception:  # noqa: BLE001
+                continue
+
+            text = self._format_chat_email(data)
+
+            try:
+                await self._client.send_message(self._mail_chat_peer, text)
+            except Exception:  # noqa: BLE001
+                pass
+
+            self._known_message_ids.add(message_id)
+
     async def _request_json(
         self,
         method: str,
@@ -381,5 +556,37 @@ class TempMailMod(loader.Module):
     def _format_error(self, error: BaseException) -> str:
         return self.strings("fetch_error").format(
             error=utils.escape_html(str(error))
+        )
+
+    def _format_chat_email(self, data: Dict) -> str:
+        email = utils.escape_html(self._format_mailbox())
+        sender = utils.escape_html(self._get_sender(data))
+        subject = utils.escape_html(data.get("subject", "—"))
+        date = utils.escape_html(data.get("createdAt", data.get("date", "")))
+
+        body = (
+            data.get("text")
+            or data.get("html")
+            or data.get("textBody")
+            or data.get("htmlBody")
+            or ""
+        )
+
+        body_text = ""
+        if isinstance(body, str):
+            trimmed = body.strip()
+            if trimmed:
+                if len(trimmed) > 2000:
+                    trimmed = f"{trimmed[:2000].rstrip()}…"
+                body_text = self.strings("chat_email_body").format(
+                    body=utils.escape_html(trimmed)
+                )
+
+        return self.strings("chat_email").format(
+            email=email,
+            sender=sender,
+            subject=subject,
+            date=date,
+            body=body_text,
         )
 
