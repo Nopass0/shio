@@ -1,6 +1,11 @@
-"""Hikka module for managing temporary email inboxes via 1secmail"""
+"""Hikka module for managing temporary email inboxes via mail.tm API"""
 
-from typing import Dict, List, Optional, Tuple
+from __future__ import annotations
+
+from dataclasses import dataclass
+import secrets
+import string
+from typing import Dict, List, Optional
 
 import aiohttp
 from hikkatl.tl.types import Message
@@ -8,7 +13,22 @@ from hikkatl.tl.types import Message
 from .. import loader, utils
 
 
-API_URL = "https://www.1secmail.com/api/v1/"
+API_BASE = "https://api.mail.tm"
+
+
+def _random_string(length: int) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+@dataclass
+class MailAccount:
+    address: str
+    password: str
+    token: Optional[str] = None
+
+    def as_email(self) -> str:
+        return self.address
 
 
 @loader.tds
@@ -55,7 +75,7 @@ class TempMailMod(loader.Module):
     }
 
     def __init__(self) -> None:
-        self._mailbox: Optional[Tuple[str, str]] = None
+        self._mailbox: Optional[MailAccount] = None
         self._timeout = aiohttp.ClientTimeout(total=10)
 
     async def tempmailcmd(self, message: Message):
@@ -122,7 +142,7 @@ class TempMailMod(loader.Module):
             return
 
         try:
-            messages = await self._fetch_messages(*mailbox)
+            messages = await self._fetch_messages()
         except Exception as error:  # noqa: BLE001
             await utils.answer(message, self._format_error(error))
             return
@@ -160,25 +180,32 @@ class TempMailMod(loader.Module):
             )
             return
 
-        if not message_id.isdigit():
+        message_id = message_id.strip()
+        if not message_id:
             await utils.answer(message, self.strings("invalid_id"))
             return
 
         try:
-            data = await self._fetch_message(*mailbox, int(message_id))
+            data = await self._fetch_message(message_id)
         except Exception as error:  # noqa: BLE001
             await utils.answer(message, self._format_error(error))
             return
 
         email = utils.escape_html(self._format_mailbox())
-        body = data.get("textBody") or data.get("htmlBody") or ""
+        body = (
+            data.get("text")
+            or data.get("html")
+            or data.get("textBody")
+            or data.get("htmlBody")
+            or ""
+        )
 
         response = [
             self.strings("message_header").format(id=message_id, email=email),
             self.strings("message_fields").format(
-                sender=utils.escape_html(data.get("from", "?")),
+                sender=utils.escape_html(self._get_sender(data)),
                 subject=utils.escape_html(data.get("subject", "—")),
-                date=utils.escape_html(data.get("date", "")),
+                date=utils.escape_html(data.get("createdAt", data.get("date", ""))),
             ),
         ]
 
@@ -191,50 +218,165 @@ class TempMailMod(loader.Module):
 
         await utils.answer(message, "\n".join(response))
 
-    async def _generate_mailbox(self) -> Tuple[str, str]:
-        data = await self._get_json({"action": "genRandomMailbox", "count": 1})
-        if not isinstance(data, list) or not data:
-            raise RuntimeError("empty response")
+    async def _generate_mailbox(self) -> MailAccount:
+        domain = await self._choose_domain()
 
-        email = data[0]
-        if "@" not in email:
-            raise RuntimeError("invalid email returned")
+        for _ in range(5):
+            login = _random_string(10)
+            password = _random_string(16)
+            address = f"{login}@{domain}"
 
-        login, domain = email.split("@", maxsplit=1)
-        return login, domain
+            try:
+                await self._request_json(
+                    "POST",
+                    "/accounts",
+                    json={"address": address, "password": password},
+                )
+            except aiohttp.ClientResponseError as error:
+                if error.status == 422:
+                    continue
+                raise
+            token = await self._obtain_token(address, password)
+            return MailAccount(address=address, password=password, token=token)
 
-    async def _fetch_messages(self, login: str, domain: str) -> List[Dict]:
-        data = await self._get_json(
-            {"action": "getMessages", "login": login, "domain": domain}
-        )
-        if not isinstance(data, list):
+        raise RuntimeError("failed to create mailbox")
+
+    async def _fetch_messages(self) -> List[Dict]:
+        headers = await self._auth_headers()
+        try:
+            data = await self._request_json("GET", "/messages", headers=headers)
+        except aiohttp.ClientResponseError as error:
+            if error.status != 401:
+                raise
+            self._reset_token()
+            headers = await self._auth_headers()
+            data = await self._request_json("GET", "/messages", headers=headers)
+
+        if not isinstance(data, dict):
             raise RuntimeError("unexpected inbox response")
-        return data
 
-    async def _fetch_message(self, login: str, domain: str, message_id: int) -> Dict:
-        data = await self._get_json(
-            {
-                "action": "readMessage",
-                "login": login,
-                "domain": domain,
-                "id": message_id,
-            }
-        )
+        items = data.get("hydra:member", [])
+        if not isinstance(items, list):
+            raise RuntimeError("unexpected inbox response")
+
+        messages: List[Dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            messages.append(
+                {
+                    "id": item.get("id", ""),
+                    "from": self._get_sender(item),
+                    "subject": item.get("subject", ""),
+                    "date": item.get("createdAt", ""),
+                }
+            )
+
+        return messages
+
+    async def _fetch_message(self, message_id: str) -> Dict:
+        headers = await self._auth_headers()
+        try:
+            data = await self._request_json(
+                "GET", f"/messages/{message_id}", headers=headers
+            )
+        except aiohttp.ClientResponseError as error:
+            if error.status != 401:
+                raise
+            self._reset_token()
+            headers = await self._auth_headers()
+            data = await self._request_json(
+                "GET", f"/messages/{message_id}", headers=headers
+            )
+
         if not isinstance(data, dict):
             raise RuntimeError("unexpected message response")
         return data
 
-    async def _get_json(self, params: Dict[str, object]) -> object:
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, object]] = None,
+        json: Optional[Dict[str, object]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> object:
+        url = f"{API_BASE}{path}"
         async with aiohttp.ClientSession(timeout=self._timeout) as session:
-            async with session.get(API_URL, params=params) as response:
+            async with session.request(
+                method, url, params=params, json=json, headers=headers
+            ) as response:
                 response.raise_for_status()
                 return await response.json(content_type=None)
+
+    async def _choose_domain(self) -> str:
+        data = await self._request_json("GET", "/domains")
+        if not isinstance(data, dict):
+            raise RuntimeError("unexpected domains response")
+
+        items = data.get("hydra:member", [])
+        if not isinstance(items, list) or not items:
+            raise RuntimeError("no domains available")
+
+        domain = secrets.choice(items)
+        if isinstance(domain, dict):
+            value = domain.get("domain")
+        else:
+            value = None
+
+        if not isinstance(value, str) or not value:
+            raise RuntimeError("invalid domain received")
+
+        return value
+
+    async def _obtain_token(self, address: str, password: str) -> str:
+        data = await self._request_json(
+            "POST",
+            "/token",
+            json={"address": address, "password": password},
+        )
+
+        if not isinstance(data, dict):
+            raise RuntimeError("unexpected token response")
+
+        token = data.get("token")
+        if not isinstance(token, str) or not token:
+            raise RuntimeError("missing token in response")
+
+        return token
+
+    async def _auth_headers(self) -> Dict[str, str]:
+        mailbox = self._mailbox
+        if not mailbox:
+            raise RuntimeError("mailbox not initialised")
+
+        token = mailbox.token
+        if not token:
+            token = await self._obtain_token(mailbox.address, mailbox.password)
+            mailbox.token = token
+
+        return {"Authorization": f"Bearer {token}"}
+
+    def _reset_token(self) -> None:
+        if self._mailbox:
+            self._mailbox.token = None
+
+    def _get_sender(self, data: Dict) -> str:
+        sender = data.get("from")
+        if isinstance(sender, dict):
+            value = sender.get("address") or sender.get("email")
+            if isinstance(value, str) and value:
+                return value
+        if isinstance(sender, str):
+            return sender
+        return "?"
 
     def _format_mailbox(self) -> str:
         if not self._mailbox:
             return ""
-        login, domain = self._mailbox
-        return f"{login}@{domain}"
+        return self._mailbox.as_email()
 
     def _format_error(self, error: BaseException) -> str:
         return self.strings("fetch_error").format(
